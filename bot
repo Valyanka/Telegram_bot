@@ -1,0 +1,241 @@
+"""
+Simple echo Telegram Bot example on Aiogram framework using
+Yandex.Cloud functions.
+"""
+
+import aiohttp
+import json
+import logging
+import os
+import ydb
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+import time
+
+log = logging.getLogger(__name__)
+log.setLevel(os.environ.get('LOGGING_LEVEL', 'INFO').upper())
+
+driver = ydb.Driver(endpoint=os.getenv('YDB_ENDPOINT'), database=os.getenv('YDB_DATABASE'))
+driver.wait(fail_fast=True, timeout=5)
+pool = ydb.SessionPool(driver)
+
+film = ""
+user_id = ""
+Set_of_blocked = set()
+bot = Bot(os.environ.get('TOKEN'))
+
+
+def get_common(session):
+    # Create the transaction and execute query.
+    s = "SELECT name, count(name) as count FROM my_table GROUP BY name ORDER BY count DESC LIMIT 15"
+    return session.transaction().execute(
+        s,
+        commit_tx=True,
+        settings=ydb.BaseRequestSettings().with_timeout(15).with_operation_timeout(4)
+    )
+
+
+def execute_query(session):
+    global film
+    global user_id
+    x = str(time.time())[1:-2]
+    s = "INSERT INTO my_table (id, user_id, name) VALUES ('" + x + "', " + str(user_id) + ",'" + str(film) + "');"
+    # извините за такое написание команд, с f строками не работает.
+    # И за то, что создаю четыре функции для одной цели, иначе не работало,
+    # а нелокальную базу данных очень хотелось
+    return session.transaction().execute(
+        s,
+        commit_tx=True,
+        settings=ydb.BaseRequestSettings().with_timeout(15).with_operation_timeout(4)
+    )
+
+
+def get_stat(session):
+    s = "SELECT name, count(name) as count FROM my_table WHERE user_id = " + str(
+        user_id) + "GROUP BY name ORDER BY count DESC"
+    return session.transaction().execute(
+        s,
+        commit_tx=True,
+        settings=ydb.BaseRequestSettings().with_timeout(15).with_operation_timeout(4)
+    )
+
+
+def get_hist(session):
+    s = "SELECT name FROM my_table WHERE user_id = " + str(user_id)
+    return session.transaction().execute(
+        s,
+        commit_tx=True,
+        settings=ydb.BaseRequestSettings().with_timeout(15).with_operation_timeout(4)
+    )
+
+
+button_hi = KeyboardButton('Привет! 👋')
+
+greet_kb = ReplyKeyboardMarkup()
+greet_kb.add(button_hi)
+
+
+async def get_json(session: aiohttp.ClientSession, url: str) -> str:
+    """
+    Asyncronously fetch (get-request) single url using provided session
+    :param session: aiohttp session object
+    :param url: target http url
+    :return: fetched text
+    """
+    async with session.get(url) as resp:
+        body = None
+        if str(resp.status)[0] == '2':
+            body = await resp.json()
+        return body
+
+
+async def async_fetch(session: aiohttp.ClientSession, url: str):
+    rating = 0
+    adress = url
+    async with session.get(url) as resp:
+        html = await resp.text()
+        rat = html.find("""<div class="rating""")
+        if rat != -1:
+            a = html[rat:].find("""title=""") + len("""title=""") + 1
+            rating = html[rat:][a: a + 3]
+        else:
+            rat = "нет рейтинга"
+        b = html.find("""<li><a href="/film/""") + len("""<li><a href="/film/""")
+        dif = 1
+        s = html[b: b + 1]
+        while s.isdigit():
+            s = html[b: b + dif + 1]
+            dif += 1
+        adress = "https://www.kinopoisk.ru/film/" + html[b: b + dif]
+        adress_to_watch = "https://www.kinopoisk.gg/film/" + html[b: b + dif]
+        return adress, adress_to_watch, rating
+
+
+# Handlers
+async def start(message: types.Message):
+    await message.reply('Добро пожаловать , {}!'.format(message.from_user.first_name) +
+                        """ С помощью этого бота вы сможете выбрать и посмотреть фильм, сериал или мультик!
+Всю необходимую информацию вы найдете с помощью команды /help, 
+однако можно и без этого - просто введите название фильма, который хотите посмотреть!""")
+
+
+async def help_han(message: types.Message):
+    await message.reply("""Советую пересмотреть "Последняя любовь на земле". Если же не хотите, то 
+вот список команд, которые помогут вам найти интересный фильм!\n\n/start - Что-то пошло не так? Давайте начнем сначала!
+/stat - Выведет список всех ваших запросов и то, сколько раз вы их запрашивали
+/hist - Выведет историю ваших запросов в хронологическом порядке
+/common_stat - Позволит вам подглядеть, какие фильмы ищут чаще всего пользователи этого бота (вы тоже учтены!)
+/help - Любите рекурсии? Тогда жмите!""")
+
+
+async def stat(message: types.Message):
+    global user_id
+    # global Set_of_blocked
+    s = ''
+    user_id = message.from_user.id
+    # if user_id in Set_of_blocked:
+    # await message.answer("""Разблокируйте сбор статистики и узнайте, что смотрят другие!
+    # Для разблокиовки воспользуйтесь коммандой on_common_stat""")
+    for i in range((len(pool.retry_operation_sync(get_stat)[0].rows))):
+        s = s + " ".join([i.decode('UTF-8') if type(i) != int else str(i) for i in
+                          list(pool.retry_operation_sync(get_stat)[0].rows[i].values())]) + "\n"
+    await message.answer('Список всех ваших запросов, упорядоченный по убыванию:\n' + s)
+
+
+async def hist(message: types.Message):
+    global user_id
+    # global Set_of_blocked
+    s = ''
+    user_id = message.from_user.id
+    # if user_id in Set_of_blocked:
+    # await message.answer("""Разблокируйте сбор статистики и узнайте, что смотрят другие!
+    # Для разблокиовки воспользуйтесь коммандой on_common_stat""")
+    for i in range((len(pool.retry_operation_sync(get_hist)[0].rows))):
+        s = s + " ".join([i.decode('UTF-8') if type(i) != int else str(i) for i in
+                          list(pool.retry_operation_sync(get_hist)[0].rows[i].values())]) + "\n"
+    await message.answer('История ваших запросов:\n' + s)
+
+
+async def common_stat(message: types.Message):
+    global user_id
+    s = ''
+    user_id = message.from_user.id
+    for i in range((len(pool.retry_operation_sync(get_common)[0].rows))):
+        s = s + " ".join([i.decode('UTF-8') if type(i) != int else str(i) for i in
+                          list(pool.retry_operation_sync(get_common)[0].rows[i].values())]) + "\n"
+    await message.answer('Топ 15 запросов среди всех пользователей:\n' + s)
+
+
+async def echo(message: types.Message):
+    splitted_message = "_".join(message.text.split())
+    splitted_message_plus = "+".join(message.text.split())
+    platform = "Кинопоиске"
+    async with aiohttp.ClientSession() as session:
+        url = "https://www.kinopoisk.ru/index.php?kp_query=" + splitted_message_plus
+        url_to_watch = "https://www.kinopoisk.gg/index.php?kp_query=" + splitted_message_plus
+        response, response_gg, rating = await async_fetch(session, url)
+        async with session.get(response) as resp:
+            if resp.status == 404:
+                response = url
+                response_gg = url_to_watch
+                platform = 'imDb'
+    global film
+    global user_id
+    films_describe = None
+    user_id = message.from_user.id
+    url_poster = "https://imdb-api.com/en/API/SearchTitle/k_okn835lz/" + splitted_message
+    film = " ".join(message.text.split()).lower()
+    async with aiohttp.ClientSession() as session:
+        films_info = await get_json(session, url_poster)
+        if films_info is not None and len(films_info) > 0:
+            url_describe = "https://imdb-api.com/ru/API/Title/k_okn835lz/" + films_info['results'][0]['id']
+            films_describe = await get_json(session, url_describe)
+    if rating == 0 and films_describe is not None:
+        rating = films_describe['imDbRating']
+    if films_describe is not None:
+        string = "🌟Рейтинг на " + platform + ": " + str(rating) + "\nСсылка на просмотр:\n" + response_gg + "\n" \
+                 + films_describe['plotLocal'] \
+                 + "\n\n" + "Ссылка на кинопоиск:\n" + response
+        await bot.send_photo(chat_id=user_id,
+                             photo='https://imdb-api.com/API/ResizeImage?apiKey=k_okn835lz&size=200x300&url='
+                                   + films_info['results'][0]['image'], caption=film + "\n" + string)
+    pool.retry_operation_sync(execute_query)
+
+
+async def register_handlers(dp: Dispatcher):
+    """Registration all handlers before processing update."""
+
+    dp.register_message_handler(start, commands=['start'])
+    dp.register_message_handler(stat, commands=['stat'])
+    dp.register_message_handler(help_han, commands=['help'])
+    dp.register_message_handler(hist, commands=['hist'])
+    dp.register_message_handler(common_stat, commands=['common_stat'])
+    dp.register_message_handler(echo)
+
+    log.debug('Handlers are registered.')
+
+
+async def process_event(event, dp: Dispatcher):
+    """
+    Converting an Yandex.Cloud functions event to an update and
+    handling tha update.
+    """
+
+    update = json.loads(event['body'])
+    log.debug('Update: ' + str(update))
+    Bot.set_current(dp.bot)
+    update = types.Update.to_object(update)
+    await dp.process_update(update)
+
+
+async def handler(event, context):
+    """Yandex.Cloud functions handler."""
+    if event['httpMethod'] == 'POST':
+        bot = Bot(os.environ.get('TOKEN'))
+        storage = MemoryStorage()
+        dp = Dispatcher(bot, storage=storage)
+        await register_handlers(dp)
+        await process_event(event, dp)
+        return {'statusCode': 200, 'body': 'ok'}
+    return {'statusCode': 405}
